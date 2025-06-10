@@ -1,4 +1,4 @@
 ***Applied Project-Quantitative Analysis***
 
-**Topic:**  
+**Topic:**
 **Application of Volatility Models on Stock Return Prediction**
