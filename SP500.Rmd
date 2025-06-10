@@ -1,0 +1,337 @@
+---
+title: "APPENDIX"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+---
+```{r,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(zoo)
+library(ggthemes)
+library(gridExtra)
+```
+
+```{r}
+data = read.csv("SP500.csv")
+```
+
+- Log close Price
+```{r}
+data = data %>% select(Date, Close)
+data$Close = as.numeric(gsub(",", "", data$Close, fixed=TRUE))
+data = data %>% mutate(Close.lead = lead(Close,1)) %>% filter(is.na(Close.lead)==FALSE)
+# Log Close Price
+data = data %>% mutate(Log.Close = log(Close))
+# Return
+data = data %>% mutate(return = Close/Close.lead-1)
+```
+
+```{r}
+ggplot()+
+  geom_line(aes(1:nrow(data),rev(data$Log.Close)),size=1)+
+  labs(x="time", y="log price", title="S&P 500 Index Daily Log Close Price")+
+  theme_clean()
+```
+
+```{r}
+ggsave("Daily Log Close Price.png",width=8,height=4.5)
+```
+
+- Return
+```{r}
+# Volatility
+window = 10
+data$volatility = append(rollapply(data$return, width=window, FUN=sd), rep(0,window-1))
+data = data %>% filter(volatility!=0)
+
+# Split
+test_samples = 50
+test = data[1:test_samples,]
+train = data[(test_samples+1):nrow(data),]
+```
+
+```{r}
+ggplot(data = data)+
+  geom_line(aes(1:nrow(data),rev(return)),size=1)+
+  ylim(-0.1,0.1)+
+  labs(x="time", y="return", title="S&P 500 Index Daily Return")+
+  theme_calc()
+
+ggsave("Daily Return.png",width=8,height=4.5)
+```
+
+- Constant Volatility
+```{r}
+# Estimators
+vol_train = sd(train$return)
+mu_train = mean(train$return)
+vol_const = data$volatility[test_samples+1]
+```
+
+```{r}
+lognormal = function(para) {
+  mu = para[1]
+  loglike = 0
+  s = vol_train
+  
+  for (i in (nrow(train)-1):1) {
+    loglike = loglike + log(dnorm(log(train$Close[i]/train$Close[i+1])+0.5*s^2,mu,s))
+  }
+  return(-loglike)
+}
+```
+
+```{r}
+para = -0.01
+mu_mle = optim(para,lognormal,gr=NULL,method="BFGS")$par
+```
+
+```{r}
+set.seed(42)
+test$noise.const = rnorm(nrow(test),0,vol_const)
+test$return.pred.const = mu_train + test$noise.const
+rmse_const = sqrt(sum((test$return.pred.const-test$return)^2)/(nrow(test)-1))
+```
+
+- Historical
+```{r}
+set.seed(42)
+for (i in seq(1,nrow(test))) {test$noise.hist[i] = rnorm(1,0,test$volatility[i])}
+test$return.pred.hist = mu_mle + test$noise.hist
+rmse_hist = sqrt(sum((test$return.pred.hist-test$return)^2)/(nrow(test)-1))
+```
+
+- EWMA
+```{r}
+# Estimators
+lambda = 0.75
+
+ewma = function(i,l,w) {
+  v = l^w * data$volatility[i+w]^2
+  for (j in seq(1,w)){
+    v = v + (1-l)*l^(j-1)*data$return[i+j]^2
+  }
+  sqrt(v)
+}
+
+for (i in seq(1,nrow(test))) {test$vol.ewma[i] = ewma(i,lambda,window)}
+
+for (i in seq(1,nrow(train))) {train$vol.ewma[i] = ewma(test_samples+i,lambda,window)}
+
+data$vol.ewma = append(test$vol.ewma,train$vol.ewma)
+
+#test$vol.ewma = sqrt(lead(lambda*test$volatility^2 + (1-lambda)*test$return^2, 1))
+#test$vol.ewma[nrow(test)] = sqrt(lambda*train$volatility[1]^2 + (1-lambda)*train$return[1]^2)
+```
+
+```{r}
+set.seed(42)
+for (i in seq(1,nrow(test))) {test$noise.ewma[i] = rnorm(1,0,test$vol.ewma[i])}
+test$return.pred.ewma = mu_mle + test$noise.ewma
+rmse_ewma = sqrt(sum((test$return.pred.ewma-test$return)^2)/(nrow(test)-1))
+```
+
+- GARCH(1,1)
+```{r}
+garch_loglike = function(para) {
+  w = para[1]
+  a = para[2]
+  b = para[3]
+  loglike = 0
+  s2 = 0
+  
+  for (i in (nrow(train)-1):1) {
+    s2 = w + a*train$return[i+1]^2 + b*s2
+    loglike = loglike + log(dnorm(train$return[i],0,sqrt(s2)))
+  }
+  return(-loglike)
+}
+```
+
+```{r, message =FALSE, warning =FALSE}
+para_mle = optim(c(0.1,0.2,0.75),garch_loglike)
+```
+
+```{r}
+y = head(train$volatility,-1)^2
+x1 = train$return[2:nrow(train)]^2
+x2 = train$volatility[2:nrow(train)]^2
+
+model_garch = lm(y~x1+x2)
+
+omega = para_mle$par[1]
+alpha = para_mle$par[2]
+beta = para_mle$par[3]
+
+#omega = model_garch$coefficients[1]
+#alpha = model_garch$coefficients[2]
+#beta = model_garch$coefficients[3]
+
+#omega = para_mle$par[1]
+#alpha = para_mle$par[2]
+#beta = 0.75
+```
+
+```{r}
+garch = function(i,w,a,b,l) {
+  v = data$volatility[i+l]^2
+  for (j in l:1) {
+    v = w + a*data$return[i+j]^2 + b*v
+    s = sqrt(v)
+  }
+  return (s)
+}
+
+for (i in seq(1,nrow(test))) {test$vol.garch[i] = garch(i,omega,alpha,beta,window)}
+
+for (i in seq(1,nrow(train))) {train$vol.garch[i] = garch(test_samples+i,omega,alpha,beta,window)}
+
+data$vol.garch = append(test$vol.garch,train$vol.garch)
+```
+
+```{r}
+set.seed(42)
+for (i in seq(1,nrow(test))) {test$noise.garch[i] = rnorm(1,0,test$vol.garch[i])}
+test$return.pred.garch = mu_mle + test$noise.garch
+rmse_garch = sqrt(sum((test$return.pred.garch-test$return)^2)/(nrow(test)-1))
+```
+
+- Plot
+```{r}
+ggplot(data=test)+
+  geom_line(aes(x=seq(1,nrow(test)),y=rep(vol_const,nrow(test)),group=1,color="Constant"),size=1)+
+  geom_line(aes(x=seq(1,nrow(test)),y=rev(volatility),group=1,color="Close to Close Historical"),size=1)+
+  geom_line(aes(x=seq(1,nrow(test)),y=rev(vol.ewma),group=1,color="EWMA"),size=1)+
+  geom_line(aes(x=seq(1,nrow(test)),y=rev(vol.garch),group=1,color="GARCH(1,1)"),size=1)+
+  labs(y="volatility",x="time", title="S&P 500 Index Moving Daily Volatility in Test Dataset", color="Method")+
+  theme_clean()
+
+ggsave("Volatility by 4 Methods.png",width=8,height=4.5)
+```
+
+- Log Stock Price Prediction
+```{r}
+log_price_pred = function(w,m,s) {
+  set.seed(42)
+  log_price_pred_list = c()
+  for (i in 1:test_samples) {
+    vol = data[i+w,s]
+    if (s == "constant") {
+      vol = vol_const
+    }
+    log_price = data$Log.Close[i+w]
+    for (j in 1:w) {
+      log_price = log_price + (m-0.5*vol^2) + rnorm(1,0,vol)
+    }
+    log_price_pred_list = append(log_price_pred_list,log_price)
+  }
+  log_price_pred_list
+}
+```
+
+```{r}
+lp = data$Log.Close[1:test_samples]
+# Constant
+lp_pred_const= log_price_pred(window,mu_mle,"constant")
+rmse_log_const = sqrt(sum((lp-lp_pred_const)^2)/(length(lp)-1))
+# Historical
+lp_pred_hist= log_price_pred(window,mu_mle,"volatility")
+rmse_log_hist = sqrt(sum((lp-lp_pred_hist)^2)/(length(lp)-1))
+# EWMA
+lp_pred_ewma= log_price_pred(window,mu_mle,"vol.ewma")
+rmse_log_ewma = sqrt(sum((lp-lp_pred_ewma)^2)/(length(lp)-1))
+# GARCH
+lp_pred_garch= log_price_pred(window,mu_mle,"vol.garch")
+rmse_log_garch = sqrt(sum((lp-lp_pred_garch)^2)/(length(lp)-1))
+```
+
+```{r}
+ggplot()+
+  geom_line(aes(1:length(lp),rev(lp)),color="dark grey",size=1)+
+  geom_line(aes(1:length(lp),rev(lp_pred_const),color="Constant"),size=1)+
+  geom_line(aes(1:length(lp),rev(lp_pred_hist),color="Close to Close Historical"),size=1)+
+  geom_line(aes(1:length(lp),rev(lp_pred_ewma),color="EWMA"),size=1)+
+  geom_line(aes(1:length(lp),rev(lp_pred_garch),color="GARCH(1,1)"),size=1)+
+  labs(y="log price",x="time",title="S&P 500 Index Log Price Prediction",color="Method")+
+  theme_clean()
+
+ggsave("Log Price Prediction.png",width=8,height=4.5)
+```
+
+- Auto Correlation
+```{r}
+auto_corr = function(lag,sample) {
+  if (lag != 0) { 
+    sample.lag = lag(sample,lag)
+    x = tail(sample,-lag)
+    y = tail(sample.lag,-lag)
+    return (cor(x,y))
+  } else {
+    return (1)
+  }
+}
+```
+
+```{r}
+ac_return = c()
+ac_r2 = c()
+ac_vol = c()
+
+lag_max = 30
+
+for (i in 1:lag_max) {
+  ac_return = append(ac_return,auto_corr(i,data$return))
+}
+
+for (i in 1:lag_max) {
+  ac_r2 = append(ac_r2,auto_corr(i,data$return^2))
+}
+
+for (i in 1:lag_max) {
+  ac_vol = append(ac_vol,auto_corr(i,data$volatility))
+}
+```
+
+```{r}
+ggplot()+
+  geom_col(aes(1:lag_max,ac_return),width=0.5)+
+  ylim(-1,1)+
+  labs(title="Return Auto Correlation",y="auto correlation", x="lag")+
+  theme_clean()
+
+ggsave("AC_Return.png",width=8,height=4.5)
+
+ggplot()+
+  geom_col(aes(1:lag_max,ac_r2),width=0.5)+
+  ylim(-1,1)+
+  labs(title="Squared Return Auto Correlation",y="auto correlation", x="lag")+
+  theme_clean()
+
+ggsave("AC_Squared Return.png",width=8,height=4.5)
+
+ggplot()+
+  geom_col(aes(1:lag_max,ac_vol),width=0.5)+
+  ylim(-1,1)+
+  labs(title="Volatility Auto Correlation",y="auto correlation", x="lag")+
+  theme_clean()
+
+ggsave("AC_Volatility.png",width=8,height=4.5)
+```
+- RMSE Table
+```{r}
+png("Return RMSE.png", width=400, height=100)
+p = round(data.frame(Constant=rmse_const,Historical=rmse_hist,EWMA=rmse_ewma,GARCH=rmse_garch),5)
+row.names(p) = "Return RMSE"
+p = tableGrob(p)
+grid.arrange(p)
+```
+
+```{r}
+png("Log Price RMSE.png", width=400, height=100)
+q = round(data.frame(Constant=rmse_log_const,Historical=rmse_log_hist,EWMA=rmse_log_ewma,GARCH=rmse_log_garch),5)
+row.names(q) = "Log Price RMSE"
+q = tableGrob(q)
+grid.arrange(q)
+```
+
