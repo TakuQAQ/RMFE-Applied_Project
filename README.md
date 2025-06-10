@@ -1,4 +1,5 @@
-***Applied Project*** \n
+***Applied Project***  
+
 ***Quantitative Analysis***
 
 **Topic:**
